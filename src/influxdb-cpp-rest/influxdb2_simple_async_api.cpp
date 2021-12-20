@@ -4,6 +4,7 @@
 
 #include <cpprest/http_client.h>
 #include <cpprest/json.h>
+#include <cpprest/rawptrstream.h>
 #include <fmt/ostream.h>
 #include <rx.hpp>
 #include <atomic>
@@ -90,25 +91,56 @@ struct simple_db::impl
                         {
                           try
                           {
-                            http_request request;
-                            request.set_request_uri(uri_with_db);
-                            request.set_method(methods::POST);
-                            request.headers().add("Authorization", "Token " + token);
-                            request.set_compressor(make_compressor(algorithm::GZIP));
-                            request.set_body(w->str());
-                            auto response = client.request(request);
-                            try
+                            std::vector<concurrency::streams::istream> streams;
+                            auto c = make_compressor(algorithm::GZIP);
+
+                            bool done = false;
+                            size_t processed = 0;
+                            size_t csize = 0;
+                            std::vector<uint8_t> pre;
+                            pre.resize(w->size());
+                            while (!done)
                             {
-                              response.wait();
-                              if (!(response.get().status_code() == status_codes::OK ||
-                                    response.get().status_code() == status_codes::NoContent))
+                              size_t used = 0;
+                              if (csize == pre.size())
                               {
-                                throw std::runtime_error(response.get().extract_string().get());
+                                pre.resize(csize * 2);
                               }
+                              auto got = c->compress(
+                                  reinterpret_cast<const uint8_t*>(w->data()) + processed,
+                                  w->size() - processed, pre.data() + csize, pre.size() - csize,
+                                  web::http::compression::operation_hint::is_last, used, done);
+                              csize += got;
+                              processed += used;
                             }
-                            catch (const std::exception& e)
+                            streams.emplace_back(
+                                concurrency::streams::rawptr_stream<uint8_t>::open_istream(
+                                    pre.data(), csize));
+
+                            for (auto& stream : streams)
                             {
-                              throw std::runtime_error(e.what());
+                              http_request request;
+                              request.set_request_uri(uri_with_db);
+                              request.set_method(methods::POST);
+                              request.headers().add("Authorization", "Token " + token);
+                              request.headers().add(header_names::content_encoding,
+                                                    algorithm::GZIP);
+
+                              request.set_body(stream);
+                              auto response = client.request(request);
+                              try
+                              {
+                                response.wait();
+                                if (!(response.get().status_code() == status_codes::OK ||
+                                      response.get().status_code() == status_codes::NoContent))
+                                {
+                                  throw std::runtime_error(response.get().extract_string().get());
+                                }
+                              }
+                              catch (const std::exception& e)
+                              {
+                                throw std::runtime_error(e.what());
+                              }
                             }
                           }
                           catch (const std::exception& e)
@@ -142,34 +174,6 @@ struct simple_db::impl
     {
       response.wait();
       if (response.get().status_code() == status_codes::OK)
-      {
-        return response.get().extract_json().get();
-      }
-      else
-      {
-        throw std::runtime_error(response.get().extract_string().get());
-        return web::json::value();
-      }
-    }
-    catch (const std::exception& e)
-    {
-      throw std::runtime_error(e.what());
-    }
-  }
-
-  web::json::value post_json(const web::uri& uri, const web::json::value& body,
-                             const web::http::status_code desired_status)
-  {
-    http_request req;
-    req.headers().add("Authorization", "Token " + token);
-    req.set_request_uri(uri);
-    req.set_method(methods::POST);
-    req.set_body(body);
-    auto response = client.request(req);
-    try
-    {
-      response.wait();
-      if (response.get().status_code() == desired_status)
       {
         return response.get().extract_json().get();
       }
@@ -231,20 +235,17 @@ struct simple_db::impl
                                 web::json::value::number(shard_duration_seconds)),
                  std::make_pair("type", web::json::value::string("expire")),
              })}))});
-    auto response = post_json(builder.to_uri(), json_body, status_codes::Created);
-    bucketid = response["id"].as_string();
-  }
-
-  void create_dbrp(const std::string& orgid, const std::string& bucket_name)
-  {
-    uri_builder builder(U("/api/v2/dbrps"));
-    auto json_body = web::json::value::object(
-        {std::make_pair("bucketID", web::json::value::string(bucketid)),
-         std::make_pair("orgID", web::json::value::string(orgid)),
-         std::make_pair("database", web::json::value::string(bucket)),
-         std::make_pair("default", web::json::value::boolean(true)),
-         std::make_pair("retention_policy", web::json::value::string("autogen"))});
-    post_json(builder.to_uri(), json_body, status_codes::Created);
+    http_request req;
+    req.set_request_uri(builder.to_uri());
+    req.set_method(methods::POST);
+    req.headers().add("Authorization", "Token " + token);
+    req.set_body(json_body);
+    auto response = client.request(req);
+    response.wait();
+    if (response.get().status_code() != status_codes::Created)
+    {
+      throw std::runtime_error(response.get().extract_string().get());
+    }
   }
 
   ~impl()
@@ -279,7 +280,6 @@ void simple_db::create()
   {
     // bucket not found
     pimpl->create_bucket(pimpl->orgid, pimpl->bucket);
-    pimpl->create_dbrp(pimpl->orgid, pimpl->bucket);
   }
   else
   {
